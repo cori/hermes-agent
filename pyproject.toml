@@ -467,3 +467,10 @@ select = ["PLW1514"]
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
+
+# CVE-2026-48710 (BadHost) override: force starlette >= 1.0.1 regardless of what
+# fastapi transitively resolves.  This lives in [tool.uv] so it does NOT appear in
+# [project.dependencies] and won't cause merge conflicts on upstream pulls.
+# Remove once fastapi natively transitively resolves a patched starlette.
+[tool.uv]
+override-dependencies = ["starlette>=1.0.1"]

@@ -25,6 +25,9 @@ overrides = [
     { name = "pynacl", specifier = ">=1.6,<1.7" },
 ]
 
+[manifest]
+overrides = [{ name = "starlette", specifier = ">=1.0.1" }]
+
 [[package]]
 name = "agent-client-protocol"
 version = "0.9.0"
