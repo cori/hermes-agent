@@ -2309,6 +2309,13 @@ class APIServerAdapter(BasePlatformAdapter):
             provider, raw = text.split("::", 1)
             if re.match(r"^[a-zA-Z0-9_.-]{2,64}$", provider) and raw.strip():
                 return provider, raw.strip()
+        # Handle @provider:model format (used by community front-ends like
+        # nesquena/hermes-webui).  The ``@`` sigil distinguishes an explicit
+        # provider hint from an Ollama ``model:tag`` colon.
+        if text.startswith("@") and ":" in text:
+            provider, raw = text[1:].split(":", 1)
+            if re.match(r"^[a-zA-Z0-9_.-]{2,64}$", provider) and raw.strip():
+                return provider, raw.strip()
         return "", text
 
     @classmethod

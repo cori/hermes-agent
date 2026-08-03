@@ -796,6 +796,39 @@ class TestModelsEndpoint:
             assert APIServerAdapter._resolve_model_name("") == "hermes-agent"
 
 
+class TestSplitProviderPrefixedModel:
+    """_split_provider_prefixed_model extracts (provider, model) from prefixed strings."""
+
+    def test_double_colon_separator(self):
+        """The :: separator is the original format."""
+        assert APIServerAdapter._split_provider_prefixed_model("ollama-cloud::glm-5.2") == (
+            "ollama-cloud",
+            "glm-5.2",
+        )
+
+    def test_at_sigil_separator(self):
+        """The @provider:model format used by community front-ends (nesquena/hermes-webui)."""
+        assert APIServerAdapter._split_provider_prefixed_model("@ollama-cloud:glm-5.2") == (
+            "ollama-cloud",
+            "glm-5.2",
+        )
+
+    def test_at_sigil_custom_provider(self):
+        """Custom provider names with hyphens work with the @ sigil."""
+        assert APIServerAdapter._split_provider_prefixed_model("@umans:umans-coder") == (
+            "umans",
+            "umans-coder",
+        )
+
+    def test_no_prefix_returns_empty_provider(self):
+        """Bare model names return ("", model) unchanged."""
+        assert APIServerAdapter._split_provider_prefixed_model("glm-5.2") == ("", "glm-5.2")
+
+    def test_ollama_tag_not_split(self):
+        """Ollama model:tag colons are not split (no @ sigil, no ::)."""
+        assert APIServerAdapter._split_provider_prefixed_model("qwen3.5:27b") == ("", "qwen3.5:27b")
+
+
     @pytest.mark.asyncio
     async def test_model_options_returns_shared_inventory(self, adapter, monkeypatch):
         """GET /api/model/options builds the shared picker payload off-loop."""
