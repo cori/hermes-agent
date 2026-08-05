@@ -35,7 +35,7 @@ import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   canImportHermesCli,
@@ -201,7 +201,11 @@ import {
   sandboxPreflight
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
-import { resolveStagedUpdaterBinary, spawnUpdaterProcess } from './updater-process'
+import {
+  resolveStagedUpdaterBinary,
+  spawnUpdaterProcess,
+  stagedUpdaterSupportsPrewrittenMarker
+} from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
@@ -574,19 +578,10 @@ function resolveHermesHome() {
 
 const HERMES_HOME = resolveHermesHome()
 
-function hermesManagedNodePathEntries() {
-  // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
-  // hermes_constants.py — this Node main process cannot import the Python
-  // module, so the platform-ordering rule is mirrored here.
-  const root = path.join(HERMES_HOME, 'node')
-  const bin = path.join(root, 'bin')
-  const entries = IS_WINDOWS ? [root, bin] : [bin, root]
-
-  return entries.filter(directoryExists)
-}
-
 function pathWithHermesManagedNode(...entries) {
-  return [...hermesManagedNodePathEntries(), ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
+  const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
+
+  return [...managed, ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
 }
 
 // ACTIVE_HERMES_ROOT — the canonical mutable Hermes install. Same path
@@ -3012,8 +3007,20 @@ async function applyUpdates(opts = {}) {
     // the venv. By writing the marker ourselves the renderer's
     // waitForUpdateToFinish() gate sees a live update and parks instead.
     // The updater overwrites this with its own PID later; same format.
-    if (Number.isInteger(child.pid)) {
+    //
+    // SKIPPED for pre-#74782 staged updaters: those have no self-PID
+    // exclusion, so they read this very marker as a foreign live owner and
+    // abort with "Another Hermes update is already running (PID <itself>)" —
+    // an unbreakable loop, because the update that would replace the stale
+    // binary is the one being refused. Losing the anti-respawn hardening is
+    // strictly better than never updating again, and the updater still writes
+    // its own marker moments later.
+    if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
       writeUpdateMarker(HERMES_HOME, child.pid)
+    } else if (Number.isInteger(child.pid)) {
+      rememberLog(
+        `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
+      )
     }
 
     rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
@@ -3100,9 +3107,15 @@ async function handOffWindowsBootstrapRecovery(reason) {
 
   // Same marker pre-write as applyUpdates — see comment there. The recovery
   // hand-off has the same window where the renderer can respawn a backend
-  // before the updater writes its own marker.
-  if (Number.isInteger(child.pid)) {
+  // before the updater writes its own marker, and the same stale-updater
+  // exclusion: a pre-#74782 binary would refuse its own pre-written claim and
+  // strand the very recovery meant to heal the install.
+  if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
     writeUpdateMarker(HERMES_HOME, child.pid)
+  } else if (Number.isInteger(child.pid)) {
+    rememberLog(
+      `[bootstrap] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
+    )
   }
 
   rememberLog(
@@ -5397,6 +5410,12 @@ function buildApplicationMenu() {
       { role: 'cut' },
       { role: 'copy' },
       { role: 'paste' },
+      // ⌘⇧V is only wired up by this item existing: an accelerator with no menu
+      // entry is never translated into an editor command, so the chord was a
+      // no-op in every input in the app. The composer inserts plain text on
+      // every paste anyway, so this is the same result as ⌘V there — it's the
+      // terminal, preview, and other editable surfaces that need the strip.
+      { role: 'pasteAndMatchStyle' },
       { role: 'delete' },
       { role: 'selectAll' }
     ]
@@ -10314,7 +10333,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   // kind+session can arrive here twice. Collapse it at this single choke point.
   // Return true (not false): a notification for the event IS being shown by the
   // first caller, so the settings "send test" success probe stays honest.
-  if (isDuplicateNotification(`${payload?.kind ?? ''}:${payload?.sessionId ?? ''}`)) {
+  if (isDuplicateNotification(`${payload?.kind ?? ''}:${payload?.sessionId ?? payload?.tag ?? ''}`)) {
     return true
   }
 
@@ -10489,6 +10508,22 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   clipboard.writeText(String(text || ''))
 
   return true
+})
+
+// Native save-location picker (profile export etc.) — the write itself happens
+// elsewhere (the backend, for profile archives); this only picks the path.
+ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: options?.title || 'Save',
+    defaultPath: options?.defaultPath ? String(options.defaultPath) : undefined,
+    filters: Array.isArray(options?.filters) ? options.filters : undefined
+  })
+
+  if (result.canceled || !result.filePath) {
+    return null
+  }
+
+  return result.filePath
 })
 
 // Paired reader for the GUI terminal's paste chord: the renderer's
