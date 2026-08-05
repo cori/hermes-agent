@@ -1,6 +1,9 @@
 name: Prepare upstream sync
 
 on:
+  schedule:
+    # Run daily at 03:00 UTC - creates/updates a review PR with upstream changes
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       upstream_ref:
