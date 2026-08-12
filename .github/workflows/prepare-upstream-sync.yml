@@ -15,7 +15,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  workflows: write  # needed to push new workflow files from upstream
 
 concurrency:
   group: prepare-upstream-sync
@@ -50,6 +49,8 @@ jobs:
             exit 0
           fi
 
+          # Use PAT for push — GITHUB_TOKEN can't push new workflow files
+          git remote set-url origin "https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/${{ github.repository }}.git"
           git push --force-with-lease origin sync/upstream-main
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
