@@ -29,7 +29,7 @@ done
 # Paths
 FORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTIVE_DIR="$HOME/.hermes/hermes-agent"
-VENV_DIR="$ACTIVE_DIR/venv"
+VENV_DIR="$ACTIVE_DIR/.venv"
 SIDECAR_DIR="/tmp/hermes-sidecar-$$"
 SIDECAR_VENV="$SIDECAR_DIR/venv"
 
@@ -123,6 +123,10 @@ else
   echo "$SMOKE_OUTPUT"
   TEST_RESULTS=1
 fi
+
+# Archive the smoke-test session immediately so it doesn't show up in the
+# desktop session list. Silent when nothing to archive.
+python3 "$HOME/.hermes/scripts/archive-smoke-test-sessions.py" || true
 
 # 7. Summary
 echo
