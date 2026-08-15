@@ -1525,6 +1525,54 @@ def kill_gateway_processes(
     return killed
 
 
+_REAPER_SUPERVISOR_WALK_LIMIT = 12
+
+
+def _reaper_candidate_is_supervisor_owned(pid: int) -> bool:
+    """True when ``pid`` is a gateway process owned by the Windows Task Scheduler.
+
+    Windows-only backstop for the orphan reaper: ``_get_service_pids()`` is
+    empty on Windows (no systemd/launchd query), so a Scheduled-Task gateway
+    whose ``gateway.pid`` record is missing or stale is invisible to both the
+    service-PID and recorded-PID exclusions — yet it is alive and supervised.
+    Scheduled Tasks run under the services tree, so a candidate whose parent
+    chain reaches ``services.exe`` is spared even with no pidfile (#83683,
+    #86098).
+
+    This check is deliberately NOT applied on POSIX: there, every process has
+    PID 1 (launchd / init / systemd) in its ancestry — and a genuine orphan is
+    *reparented directly to PID 1* — so supervisor-name ancestry carries zero
+    signal and would spare every orphan the reaper exists to kill (#51325,
+    #75936). POSIX supervised gateways are already covered pidfile-
+    independently by the ``_get_service_pids()`` exclusion.
+
+    Known limitation (fail-open): if the Task-launched bootstrap parent has
+    already exited, Windows does not reparent the gateway, the chain breaks
+    before ``services.exe``, and the gateway is treated as an orphan. Any
+    error (process gone, psutil unavailable) is likewise treated as "not
+    owned" so a genuine orphan is still reaped.
+    """
+    if not is_windows():
+        return False
+    try:
+        import psutil  # type: ignore
+
+        parent = psutil.Process(pid).parent()
+        for _ in range(_REAPER_SUPERVISOR_WALK_LIMIT):
+            if parent is None:
+                break
+            try:
+                name = (parent.name() or "").lower()
+            except Exception:
+                name = ""
+            if name == "services.exe":
+                return True
+            parent = parent.parent()
+    except Exception:
+        pass
+    return False
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see.
 
@@ -1555,10 +1603,54 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     own = {os.getpid()}
     if extra_exclude:
         own |= extra_exclude
+    # Service-managed gateways are not orphans — never reap them.  This
+    # covers macOS launchd (supports_systemd_services() is False there, so
+    # without this the launchd gateway looks like an unsupervised orphan and
+    # gets SIGTERM'd, causing launchd to restart it — or leaving it down
+    # under KeepAlive.SuccessfulExit=false) and any systemd unit reachable
+    # from a host that got past the gate above (#83683, #85344).
+    try:
+        own |= _get_service_pids()
+    except Exception:
+        pass
+    # On Windows there is no systemd/launchd service query at all
+    # (_get_service_pids() returns an empty set), so a gateway supervised by
+    # a Scheduled Task / Startup VBS looks like an unsupervised orphan to the
+    # process scan (#86098).  The same holds on every platform for a healthy
+    # gateway launched standalone (no service registration) whose PID the
+    # runtime record can see (#83683).  Exempt the recorded healthy gateway
+    # PID and its parent chain: a recorded, liveness-verified gateway is by
+    # definition not an orphan "the pidfile/runtime record can't see", and
+    # the Scheduled-Task bootstrap's argv (``gateway run``) matches the
+    # gateway scan — killing that bootstrap takes the detached gateway it
+    # spawned down with it.
+    try:
+        from gateway.status import get_running_pid
+
+        recorded = get_running_pid()
+        if recorded and recorded > 0:
+            own.add(recorded)
+            try:
+                import psutil  # type: ignore
+
+                parent = psutil.Process(recorded).parent()
+                while parent is not None:
+                    own.add(parent.pid)
+                    parent = parent.parent()
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         # find_gateway_pids() includes no-supervisor `gateway restart` runtimes
-        # for the current profile when no systemd supervisor is present.
-        orphans = [p for p in find_gateway_pids(exclude_pids=own) if p and p > 0]
+        # for the current profile when no systemd supervisor is present.  On
+        # Windows, additionally drop any candidate the Task Scheduler owns —
+        # the pidfile-less gap neither exclusion above can see (#83683, #86098).
+        orphans = [
+            p
+            for p in find_gateway_pids(exclude_pids=own)
+            if p and p > 0 and not _reaper_candidate_is_supervisor_owned(p)
+        ]
     except Exception:
         return False
     if not orphans:
@@ -2444,6 +2536,94 @@ def install_linux_gateway_from_setup(force: bool = False, enable_on_startup: boo
 
     systemd_install(force=force, system=False, enable_on_startup=enable_on_startup)
     return scope, True
+
+
+def ensure_gateway_service(context: str = "setup") -> bool:
+    """Install and start the gateway service without prompting.
+
+    The zero-decision service path used by ``hermes setup`` (end of wizard)
+    and ``hermes import``: if this host supports a service manager and no
+    gateway service exists yet, install a user-scope service and start it.
+    A gateway with zero configured platforms is a supported degraded mode
+    (it runs the cron scheduler and picks up platforms as tokens appear),
+    so this never needs to gate on messaging being configured.
+
+    Never prompts, never raises — always safe to call from any flow,
+    including non-TTY ones. Returns True when a service is installed and
+    running (or already was) by the time we return.
+
+    Scope choice: always the least-surprising, no-privilege option —
+    user-scope systemd unit on Linux, LaunchAgent on macOS, Scheduled Task
+    on Windows. Users who want a boot-time system service still run
+    ``hermes gateway install --system`` explicitly (that path prompts and
+    requires root; we never self-elevate from an installer).
+    """
+    from hermes_constants import is_container
+
+    if is_container():
+        # Containers use restart policies, not service managers.
+        print_info("Start the gateway to bring your bots online:")
+        print_info("   hermes gateway run          # Run as container main process")
+        print_info("")
+        print_info("For automatic restarts, use a Docker restart policy:")
+        print_info("   docker run --restart unless-stopped ...")
+        return False
+
+    supports_systemd = supports_systemd_services()
+    if not (supports_systemd or is_macos() or is_windows()):
+        print_info("  No supported service manager found on this host.")
+        print_info("  Run the gateway in the foreground with: hermes gateway")
+        return False
+
+    try:
+        if _is_service_running():
+            return True
+
+        if not _is_service_installed():
+            if supports_systemd and has_conflicting_systemd_units():
+                # Both user and system units would fight over bot tokens.
+                # Don't pile a fresh install onto a conflicted state.
+                print_systemd_scope_conflict_warning()
+                return False
+            print_info("  Installing the gateway background service ...")
+            if supports_systemd:
+                systemd_install(force=False, non_interactive=True)
+            elif is_macos():
+                launchd_install(force=False)
+            else:
+                from hermes_cli import gateway_windows
+
+                # Registers the Scheduled Task AND starts it.
+                gateway_windows.install(force=False)
+                print_success("  Gateway service installed and started.")
+                return True
+
+        if supports_systemd:
+            systemd_start()
+        elif is_macos():
+            launchd_start()
+        else:
+            from hermes_cli import gateway_windows
+
+            gateway_windows.start()
+        print_success("  Gateway service running (cron jobs + messaging platforms).")
+        return True
+    except UserSystemdUnavailableError as e:
+        print_warning("  Could not reach user systemd to start the gateway service:")
+        for line in str(e).splitlines():
+            print_info(f"  {line}")
+    except SystemScopeRequiresRootError as e:
+        print_warning(f"  Gateway service needs root for this scope: {e}")
+        _print_system_scope_remediation("start")
+    except SystemExit:
+        # Some install/start paths sys.exit() on hard failures (e.g. temp-HOME
+        # guard). A background-service failure must never abort setup/import.
+        print_warning("  Gateway service install did not complete.")
+        print_info("  You can retry manually: hermes gateway install")
+    except Exception as e:
+        print_warning(f"  Gateway service install failed: {e}")
+        print_info("  You can retry manually: hermes gateway install")
+    return False
 
 
 def get_systemd_linger_status() -> tuple[bool | None, str]:
@@ -4873,25 +5053,44 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
         # to config.yaml.
         from gateway.config import _env_multiplex_profiles_override
 
+        cfg_path = default_root / "config.yaml"
+        cfg = {}
+        if cfg_path.exists():
+            # Raw read of the DEFAULT root's config (not the active profile
+            # home, so load_config() is the wrong owner here); whole probe is
+            # fail-open via the enclosing except.
+            from hermes_cli.config import read_user_config_raw
+
+            cfg = read_user_config_raw(cfg_path)
+
         env_multiplex = _env_multiplex_profiles_override()
         if env_multiplex is False:
             return  # explicitly forced OFF by the operator env override
         if env_multiplex is True:
             multiplex = True
         else:
-            cfg_path = default_root / "config.yaml"
             if not cfg_path.exists():
                 return
-            # Raw read of the DEFAULT root's config (not the active profile
-            # home, so load_config() is the wrong owner here); whole probe is
-            # fail-open via the enclosing except.
-            from hermes_cli.config import read_user_config_raw
-            cfg = read_user_config_raw(cfg_path)
             multiplex = bool(
                 cfg.get("multiplex_profiles")
                 or (cfg.get("gateway", {}) or {}).get("multiplex_profiles")
             )
         if not multiplex:
+            return
+
+        gateway_cfg = cfg.get("gateway", {}) or {}
+        if "multiplex_profile_allowlist" in cfg:
+            raw_allowlist = cfg.get("multiplex_profile_allowlist")
+        else:
+            raw_allowlist = gateway_cfg.get("multiplex_profile_allowlist")
+        from gateway.config import _normalize_multiplex_profile_allowlist
+        from hermes_cli.profiles import normalize_profile_name
+
+        profile_allowlist = _normalize_multiplex_profile_allowlist(raw_allowlist)
+        if (
+            profile_allowlist is not None
+            and normalize_profile_name(suffix) not in profile_allowlist
+        ):
             return
     except Exception:
         logger.debug("Multiplexer-conflict probe failed", exc_info=True)

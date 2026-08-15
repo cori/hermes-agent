@@ -49,6 +49,7 @@ import type {
 } from '../../../types'
 
 import {
+  appendMidTurnUserMessage,
   applyBranchVisibility,
   applyReloadOptimistic,
   applyRewindOptimistic,
@@ -56,7 +57,10 @@ import {
   planEdit,
   planReload,
   planRestore,
+  rebindSurvivorRowIds,
   runRewindSubmit,
+  survivorRowIdsFrom,
+  type SurvivorUserRowIds,
   truncateSubmitParams
 } from './rewind'
 import { useSlashCommand } from './slash'
@@ -67,8 +71,10 @@ import {
   friendlyRemoteAttachError,
   type GatewayRequest,
   inlineErrorMessage,
+  markSessionRecentlyInterrupted,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
+  shouldInterruptBeforeRewind,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -130,14 +136,16 @@ export async function uploadComposerAttachment(
 
   // Read bytes/paths ONCE, outside the retry. Only the session-scoped RPC is
   // replayed on recovery — re-reading a multi-MB file to retry a dead session
-  // id would double the disk/IPC cost of every recovered attach.
+  // id would double the disk/IPC cost of every recovered attach. For images,
+  // the chip's previewUrl already holds the full file as a base64 data URL,
+  // so passing it avoids re-reading the same bytes off disk at submit.
   let imagePayload: Awaited<ReturnType<typeof readImageForRemoteAttach>> | null = null
   let fileDataUrl: null | string = null
 
   if (uploadBytes) {
     try {
       if (attachment.kind === 'image') {
-        imagePayload = await readImageForRemoteAttach(path)
+        imagePayload = await readImageForRemoteAttach(path, attachment.previewUrl)
       } else {
         fileDataUrl = await readFileDataUrlForAttach(path)
       }
@@ -228,6 +236,7 @@ interface PromptActionsOptions {
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
   sttEnabled: boolean
@@ -259,6 +268,7 @@ export function usePromptActions({
   refreshSessions,
   requestGateway,
   resumeStoredSession,
+  runtimeIdByStoredSessionIdRef,
   selectedStoredSessionIdRef,
   startFreshSessionDraft,
   sttEnabled,
@@ -273,7 +283,7 @@ export function usePromptActions({
       role: ChatMessage['role'],
       text: string,
       storedSessionId?: string | null,
-      options: { insertBeforeActiveReply?: boolean } = {}
+      options: { appendAfterActiveReply?: boolean } = {}
     ) => {
       // Strip ANSI: slash-command output from the backend worker carries SGR
       // color codes (e.g. "Unknown command" in red). The ESC byte is invisible
@@ -296,23 +306,16 @@ export function usePromptActions({
             parts: [textPart(body)]
           }
 
-          const streamIndex =
-            options.insertBeforeActiveReply && state.streamId
-              ? state.messages.findIndex(candidate => candidate.id === state.streamId)
-              : -1
+          // Mid-turn correction: arrival order. The bubble lands after the
+          // assistant output the user had already seen (sealing the live
+          // stream so post-redirect deltas continue BELOW the correction),
+          // never spliced above it (#73793) or mid-thread via the old
+          // last-assistant fallback (#83151).
+          if (options.appendAfterActiveReply) {
+            return appendMidTurnUserMessage(state, message)
+          }
 
-          const lastAssistantIndex = options.insertBeforeActiveReply
-            ? state.messages.map(candidate => candidate.role).lastIndexOf('assistant')
-            : -1
-
-          const insertionIndex = streamIndex >= 0 ? streamIndex : lastAssistantIndex
-
-          const messages =
-            insertionIndex >= 0
-              ? [...state.messages.slice(0, insertionIndex), message, ...state.messages.slice(insertionIndex)]
-              : [...state.messages, message]
-
-          return { ...state, messages }
+          return { ...state, messages: [...state.messages, message] }
         },
         storedSessionId ?? selectedStoredSessionIdRef.current
       )
@@ -475,6 +478,7 @@ export function usePromptActions({
     getRuntimeIdForStoredSession,
     getRouteToken,
     requestGateway,
+    runtimeIdByStoredSessionIdRef,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
@@ -644,6 +648,10 @@ export function usePromptActions({
       return
     }
 
+    // Frontend busy clears immediately; gateway wind-down can lag. Mark so a
+    // fast edit/resend still interrupt-first instead of racing 4009 (#83855).
+    markSessionRecentlyInterrupted(sessionId)
+
     updateSessionState(sessionId, state => {
       const streamId = state.streamId
       const messages = finalizeInterruptedMessages(state.messages, streamId)
@@ -715,10 +723,11 @@ export function usePromptActions({
       // transcript rather than a system note that changes role after reload.
       const send = async (id: string): Promise<boolean> => {
         // Redirect aborts the model request, so the completion event can race
-        // its RPC response. Insert before the live reply *before* awaiting the
-        // gateway; appending after the response leaves the correction below a
-        // reply that the redirect has already replaced.
-        const messageId = appendSessionTextMessage(id, 'user', text, undefined, { insertBeforeActiveReply: true })
+        // its RPC response. Record the correction *before* awaiting the
+        // gateway, in arrival order: sealed already-streamed output above,
+        // correction bubble below it, post-redirect deltas below that
+        // (#73793, #83151).
+        const messageId = appendSessionTextMessage(id, 'user', text, undefined, { appendAfterActiveReply: true })
 
         const discardOptimisticMessage = () =>
           updateSessionState(id, state => ({
@@ -784,6 +793,25 @@ export function usePromptActions({
     [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
   )
 
+  // After a durable rewind the surviving bubbles' cached rowIds are stale (the
+  // gateway re-inserted the kept prefix as new SQLite rows). Rebind them to the
+  // authoritative post-rewrite ids so the NEXT rewind/edit/regenerate doesn't
+  // send a dead id and get refused with 4018 (consecutive-rewind staleness,
+  // #83202 review).
+  const applySurvivorRowIds = useCallback(
+    (sessionId: string, survivorRowIds: SurvivorUserRowIds | undefined) => {
+      if (!survivorRowIds) {
+        return
+      }
+
+      updateSessionState(sessionId, state => ({
+        ...state,
+        messages: rebindSurvivorRowIds(state.messages, survivorRowIds)
+      }))
+    },
+    [updateSessionState]
+  )
+
   const reloadFromMessage = useCallback(
     async (parentId: string | null) => {
       // Ref, not the closure-captured prop — a truncating resubmit aimed at a
@@ -804,15 +832,17 @@ export function usePromptActions({
       updateSessionState(sessionId, state => applyReloadOptimistic(state, plan))
 
       try {
-        await requestGateway(
+        const result = await requestGateway<{ survivor_user_row_ids?: unknown }>(
           'prompt.submit',
           {
             session_id: sessionId,
             text: plan.text,
-            ...truncateSubmitParams(plan.truncateOrdinal)
+            ...truncateSubmitParams(plan.truncateOrdinal, plan.truncateMessageId, plan.truncateRowId)
           },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
+
+        applySurvivorRowIds(sessionId, survivorRowIdsFrom(result))
       } catch (err) {
         updateSessionState(sessionId, state => ({
           ...state,
@@ -822,7 +852,7 @@ export function usePromptActions({
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
+    [activeSessionIdRef, applySurvivorRowIds, copy.regenerateFailed, requestGateway, updateSessionState]
   )
 
   // Cursor-style "restore checkpoint": rewind the conversation to a past user
@@ -835,14 +865,30 @@ export function usePromptActions({
   // fresh turn. Live/stuck turns interrupt first, and a raced "session busy"
   // response interrupts + retries through the shared busy gate.
   const submitRewindPrompt = useCallback(
-    (sessionId: string, text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) =>
-      runRewindSubmit(requestGateway, sessionId, text, truncateOrdinal, interruptFirst, {
-        storedSessionId: selectedStoredSessionIdRef.current,
-        onSessionRecovered: recoveredId => {
-          activeSessionIdRef.current = recoveredId
-          setActiveSessionId(recoveredId)
-        }
-      }),
+    (
+      sessionId: string,
+      text: string,
+      truncateOrdinal: number | undefined,
+      truncateMessageId: string | undefined,
+      interruptFirst: boolean,
+      truncateRowId?: number
+    ) =>
+      runRewindSubmit(
+        requestGateway,
+        sessionId,
+        text,
+        truncateOrdinal,
+        truncateMessageId,
+        interruptFirst,
+        {
+          storedSessionId: selectedStoredSessionIdRef.current,
+          onSessionRecovered: recoveredId => {
+            activeSessionIdRef.current = recoveredId
+            setActiveSessionId(recoveredId)
+          }
+        },
+        truncateRowId
+      ),
     [activeSessionIdRef, requestGateway, selectedStoredSessionIdRef]
   )
 
@@ -866,6 +912,13 @@ export function usePromptActions({
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
+      // Capture before optimistic busy=true — otherwise interruptFirst is always
+      // true and idle restores wrongly interrupt (and Stop→edit misses cooldown).
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: busyRef.current || $busy.get(),
+        sessionId
+      })
+
       clearNotifications()
       setMutableRef(busyRef, true)
       setBusy(true)
@@ -873,7 +926,16 @@ export function usePromptActions({
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        const survivorRowIds = await submitRewindPrompt(
+          sessionId,
+          plan.text,
+          plan.truncateOrdinal,
+          plan.truncateMessageId,
+          interruptFirst,
+          plan.truncateRowId
+        )
+
+        applySurvivorRowIds(sessionId, survivorRowIds)
       } catch (err) {
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
@@ -891,7 +953,7 @@ export function usePromptActions({
         throw err
       }
     },
-    [activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
+    [activeSessionIdRef, applySurvivorRowIds, busyRef, submitRewindPrompt, updateSessionState]
   )
 
   const editMessage = useCallback(
@@ -914,31 +976,30 @@ export function usePromptActions({
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
+      // Before optimistic busy=true — see restoreToMessage (#83855).
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: busyRef.current || $busy.get(),
+        sessionId
+      })
+
       clearNotifications()
       setMutableRef(busyRef, true)
       setBusy(true)
       setAwaitingResponse(true)
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
 
-      const isStaleTargetError = (err: unknown) =>
-        /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
-
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        const survivorRowIds = await submitRewindPrompt(
+          sessionId,
+          plan.text,
+          plan.truncateOrdinal,
+          plan.truncateMessageId,
+          interruptFirst,
+          plan.truncateRowId
+        )
+
+        applySurvivorRowIds(sessionId, survivorRowIds)
       } catch (err) {
-        let surfaced = err
-
-        if (!plan.isFailedTurn && isStaleTargetError(err)) {
-          try {
-            // Already interrupted on the first attempt — submit as a plain resend.
-            await submitRewindPrompt(sessionId, plan.text, undefined, false)
-
-            return
-          } catch (retryErr) {
-            surfaced = retryErr
-          }
-        }
-
         // Roll the optimistic edit/truncation back to the original history so the
         // UI stays in sync with what's persisted instead of stranding a partial
         // timeline.
@@ -946,10 +1007,10 @@ export function usePromptActions({
         setBusy(false)
         setAwaitingResponse(false)
         updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false, messages }))
-        notifyError(surfaced, copy.editFailed)
+        notifyError(err, copy.editFailed)
       }
     },
-    [activeSessionIdRef, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
+    [activeSessionIdRef, applySurvivorRowIds, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
   )
 
   const handleThreadMessagesChange = useCallback(

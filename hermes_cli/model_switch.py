@@ -45,6 +45,7 @@ from agent.models_dev import (
     get_model_info,
     list_provider_models,
 )
+from utils import base_url_host_matches, base_url_hostname
 
 # Providers whose picker model list should NOT be capped by max_models.
 # OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
@@ -1651,7 +1652,7 @@ def switch_model(
         is_custom = (
             current_provider in {"custom", "local"}
             or current_provider.startswith("custom:")
-            or ("localhost" in _base or "127.0.0.1" in _base)
+            or base_url_hostname(_base) in ("localhost", "127.0.0.1")
         )
 
         if (
@@ -1911,10 +1912,10 @@ def switch_model(
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
     # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
+    capabilities = get_model_capabilities(target_provider, new_model, allow_network=True)
 
     # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+    model_info = get_model_info(target_provider, new_model, allow_network=True)
 
     # --- Collect warnings ---
     warnings: list[str] = []
@@ -2798,7 +2799,7 @@ def list_authenticated_providers(
             # explicit models: dict — avoid a misleading zero count in /model.
             if not models_list:
                 url_lower = str(api_url).strip().lower()
-                if "api.openai.com" in url_lower:
+                if base_url_host_matches(url_lower, "api.openai.com"):
                     fb = curated.get("openai") or []
                     if fb:
                         models_list = list(fb)
