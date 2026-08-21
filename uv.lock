@@ -29,10 +29,8 @@ huggingface-hub = false
 overrides = [
     { name = "cryptography", specifier = ">=50,<51" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
+    { name = "starlette", specifier = ">=1.0.1" },
 ]
-
-[manifest]
-overrides = [{ name = "starlette", specifier = ">=1.0.1" }]
 
 [[package]]
 name = "agent-client-protocol"
