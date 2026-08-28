@@ -91,3 +91,117 @@ describe('newSessionInProfile', () => {
     expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 })
+
+describe('selectProfile startup preference (#79886)', () => {
+  const rememberProfile = vi.fn(async (name: null | string) => ({ profile: name }))
+
+  beforeEach(() => {
+    rememberProfile.mockClear()
+
+    const getConnection = vi.fn(async () => ({ mode: 'local' }))
+
+    const getConnectionConfig = vi.fn(async () => ({ mode: 'local' }))
+
+    ;(globalThis as { window?: unknown }).window = {
+      hermesDesktop: {
+        getConnection,
+        getConnectionConfig,
+        profile: { remember: rememberProfile }
+      }
+    }
+  })
+
+  it('remembers the selected workspace for the next Desktop launch', async () => {
+    activeGatewayConnectionId.mockReturnValue(null)
+
+    selectProfile('tilly')
+
+    await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('tilly')
+  })
+
+  it('waits for gateway activation before replacing the startup preference', async () => {
+    let resolveGateway!: () => void
+
+    activeGatewayConnectionId.mockReturnValue(null)
+    ensureGatewayForProfile.mockImplementationOnce(
+      () =>
+        new Promise<undefined>(resolve => {
+          resolveGateway = () => resolve(undefined)
+        })
+    )
+
+    selectProfile('tilly')
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('tilly'))
+    expect(rememberProfile).not.toHaveBeenCalled()
+
+    resolveGateway()
+
+    await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
+  })
+
+  it('does not replace the startup preference for a registry-source pick', async () => {
+    activeGatewayConnectionId.mockReturnValue('mini')
+
+    selectProfile('researcher')
+
+    await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('mini', 'researcher'))
+    expect(rememberProfile).not.toHaveBeenCalled()
+  })
+
+  it('remembers an already-active local profile after returning from All Profiles', async () => {
+    activeGatewayConnectionId.mockReturnValue(null)
+    $activeGatewayProfile.set('tilly')
+
+    selectProfile('tilly')
+
+    await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
+  })
+
+  it('keeps local startup persistence when the backend descriptor lookup fails', async () => {
+    activeGatewayConnectionId.mockReturnValue(null)
+
+    const getConnection = vi.fn(async () => {
+      throw new Error('descriptor unavailable')
+    })
+
+    const getConnectionConfig = vi.fn(async () => ({ mode: 'local' }))
+
+    ;(globalThis as { window?: unknown }).window = {
+      hermesDesktop: {
+        getConnection,
+        getConnectionConfig,
+        profile: { remember: rememberProfile }
+      }
+    }
+
+    selectProfile('tilly')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('tilly'))
+    await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
+  })
+
+  it('does not replace the local startup preference for a profile SSH override', async () => {
+    activeGatewayConnectionId.mockReturnValue(null)
+
+    const getConnection = vi.fn(async () => ({ mode: 'remote', remoteKind: 'ssh' }))
+
+    const getConnectionConfig = vi.fn(async () => ({ mode: 'ssh' }))
+
+    ;(globalThis as { window?: unknown }).window = {
+      hermesDesktop: {
+        getConnection,
+        getConnectionConfig,
+        profile: { remember: rememberProfile }
+      }
+    }
+
+    selectProfile('macmini-hermes')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('macmini-hermes'))
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledWith('macmini-hermes'))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(rememberProfile).not.toHaveBeenCalled()
+  })
+})
