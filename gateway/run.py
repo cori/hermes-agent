@@ -392,8 +392,12 @@ async def run_codex_hygiene_compaction(
     count_before = getattr(compressor, "compression_count", 0)
     try:
         await asyncio.wait_for(
+            # copy_context().run: keep the caller's profile secret scope /
+            # HERMES_HOME override in the worker (multiplex_profiles) — same
+            # class as the detached-agent hygiene path below.
             loop.run_in_executor(
                 None,
+                copy_context().run,
                 lambda: agent._compress_context(
                     history,
                     "",
@@ -2982,6 +2986,7 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    TranscriptReadError,
     build_session_context,
     build_session_context_prompt,
     build_channel_continuity_note,
@@ -7863,7 +7868,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         failure after recording that recoverable state so ``__init__`` can
         record ``_session_db_init_error`` for the #88235 broadcast.
         """
-        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path
+        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path, get_shared_session_db
         from gateway.session_db_recovery import RecoverableHandleCache
 
         path = Path(_default_db_path())
@@ -7905,7 +7910,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # unavailability the store is already reporting.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(SessionDB())
+                return AsyncSessionDB(get_shared_session_db())
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
@@ -7956,8 +7961,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             inner = getattr(db, "_db", db)
             if inner is None or not hasattr(inner, "close"):
                 return
+            from hermes_state import release_or_close
             try:
-                inner.close()
+                release_or_close(inner)
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
 
@@ -9482,9 +9488,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:  # noqa: BLE001 - unreadable source => assume busy
             logger.debug("scale-to-zero: api work count unreadable — staying awake", exc_info=True)
             api_count = 1
+        # An attached dashboard/desktop/TUI client is inbound activity too. It
+        # lives in the DASHBOARD process, so it reaches us as a file mtime that
+        # process refreshes on every WS frame (gateway/scale_to_zero.py). Fold
+        # it into the inbound clock rather than adding a conjunct: the client
+        # then gets the same idle_timeout grace after it disconnects as a chat
+        # message does, and a lingering marker cannot pin the box (an old mtime
+        # is outside idle_timeout just like an old _last_inbound_at).
+        last_inbound = self._last_inbound_at
+        try:
+            from gateway.scale_to_zero import dashboard_client_last_seen
+
+            seen = dashboard_client_last_seen()
+        except Exception:  # noqa: BLE001 - unreadable source => assume busy
+            logger.debug("scale-to-zero: dashboard heartbeat unreadable — staying awake", exc_info=True)
+            seen = time.time()
+        if seen is not None and seen > last_inbound:
+            last_inbound = seen
         return is_idle(
             active_work_count=self._running_agent_count() + cron_count + api_count,
-            seconds_since_last_inbound=time.time() - self._last_inbound_at,
+            seconds_since_last_inbound=time.time() - last_inbound,
             idle_timeout_seconds=self._scale_to_zero_idle_timeout_seconds(),
             has_live_background_work=self._scale_to_zero_has_live_background_work(),
         )
@@ -9876,7 +9899,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                if drain_requested():
+                # drain_requested() does a synchronous read_text() on the
+                # marker file. At this 1s cadence that puts a blocking disk
+                # read on the event loop ~86k times a day; when the host is
+                # under I/O pressure a single read can stall for 30s+ and
+                # take every platform heartbeat down with it. Off-thread it.
+                if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
@@ -16473,6 +16501,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 GatewayRunner.close_all_session_db_handles(self)
             except Exception as _e:
                 logger.debug("Runner SessionDB handle sweep error: %s", _e)
+            # Final sweep: close any shared SessionDB instances still held by
+            # the process-wide registry (in-process tools, cron, mirror, etc.
+            # that opened via get_shared_session_db but weren't released by
+            # the sweeps above).  This is the safety net that guarantees no
+            # WAL write lock survives past gateway shutdown (#90837).
+            try:
+                from hermes_state import close_shared_session_dbs
+                closed = close_shared_session_dbs()
+                if closed:
+                    logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
+            except Exception as _e:
+                logger.debug("Shared SessionDB close error: %s", _e)
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
@@ -20828,8 +20868,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
-        # Load conversation history from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from transcript. An unreadable canonical
+        # store is not an empty conversation: stop before the agent can invent
+        # continuity from a plausible-looking []. This return happens before
+        # the broad cleanup finally below, so restore task-local context here;
+        # the outer dispatch still clears the durable marker and turn lease.
+        try:
+            history = await self.async_session_store.load_transcript(
+                session_entry.session_id
+            )
+        except TranscriptReadError:
+            self._clear_session_env(_session_env_tokens)
+            return (
+                "⚠️ This session's history is temporarily unavailable, so "
+                "this message was not processed. Ask the operator to inspect "
+                "state.db, then resend after it is healthy. Use /reset only "
+                "if you intentionally want to start a new conversation."
+            )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -21270,8 +21325,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_commit_fence = CompressionCommitFence(
                                         total_ceiling_seconds=_hyg_total_ceiling_seconds
                                     )
+                                    # Default executor (NOT self._get_executor):
+                                    # a fence-cancelled hung summary must never
+                                    # occupy one of the gateway's agent-work
+                                    # slots. But it MUST run inside the caller's
+                                    # contextvars: under multiplex_profiles the
+                                    # profile secret scope / HERMES_HOME override
+                                    # live in ContextVars, and a bare
+                                    # run_in_executor worker starts with an empty
+                                    # Context — the summary model's
+                                    # get_secret(<PROVIDER>_API_KEY) then fails
+                                    # closed (UnscopedSecretError) and every
+                                    # hygiene compaction silently degrades to a
+                                    # lossy truncation (#100849 bundle).
                                     _hyg_future = loop.run_in_executor(
                                         None,
+                                        copy_context().run,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
@@ -21419,6 +21488,175 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # uncompressed) but with distinct provenance,
                                         # user message, and NO failure-cooldown
                                         # increment.
+                                        #
+                                        # #97963: decouple the TURN from the
+                                        # COMPRESSION. When the worker's commit is
+                                        # watermark-fenced (it captured the session's
+                                        # active-row watermark at compression start,
+                                        # so rows appended after that point — this
+                                        # released turn included — survive its late
+                                        # commit verbatim as cloned concurrent tail),
+                                        # the already-running attempt KEEPS its commit
+                                        # admission: the user's turn proceeds on the
+                                        # uncompressed transcript NOW, and the summary
+                                        # is adopted when the detached worker reaches
+                                        # its own watermark-fenced commit transaction
+                                        # (archive_and_compact / the rotation publish
+                                        # path — the next safe boundary). Before this,
+                                        # the fence was ALWAYS cancelled here, burning
+                                        # the full summary attempt — for a thinking
+                                        # summary model whose reasoning prefix alone
+                                        # exceeds the 10s hold, that made hygiene
+                                        # auto-compression fail 100% of the time while
+                                        # paying the summary model per turn. The turn
+                                        # itself is still released at the same budget:
+                                        # only the fate of the detached worker's
+                                        # RESULT changes. If the commit is NOT
+                                        # watermark-fenced (no session_db, watermark
+                                        # capture failed, legacy lock API), a late
+                                        # commit could clobber newer turns, so cancel
+                                        # exactly as before — never worse than the
+                                        # status quo.
+                                        _hyg_keep_admission = bool(
+                                            getattr(
+                                                _hyg_commit_fence,
+                                                "commit_watermark_fenced",
+                                                False,
+                                            )
+                                        ) and not _hyg_commit_fence.is_cancelled
+                                        if _hyg_keep_admission:
+                                            self._defer_agent_cleanup_until_future_done(
+                                                _hyg_future,
+                                                _hyg_agent,
+                                                context="session hygiene turn-hold",
+                                            )
+                                            _hyg_cleanup_deferred = True
+                                            # NO retry-after here (#97963 (b)): the
+                                            # attempt is still running toward a real
+                                            # commit, and arming the flat 60s
+                                            # retry-after would ALSO block the
+                                            # agent-side preflight compressor from a
+                                            # fresh chance ("Skipping preflight
+                                            # compression: same-session cooldown
+                                            # active"). Re-attempt spacing is covered
+                                            # by the durable compression lock instead:
+                                            # the next turn's hygiene pre-check skips
+                                            # while this worker's lease is held
+                                            # (_session_has_compression_in_flight).
+                                            # The flat retry-after is recorded by the
+                                            # done-callback below ONLY if the worker
+                                            # ends without committing anything.
+                                            _hyg_deferred_sid = session_entry.session_id
+                                            _hyg_deferred_key = session_key
+                                            _hyg_deferred_agent = _hyg_agent
+
+                                            def _hyg_adopt_or_space_retry(
+                                                _fut,
+                                                _gw=self,
+                                                _sid=_hyg_deferred_sid,
+                                                _skey=_hyg_deferred_key,
+                                                _agent=_hyg_deferred_agent,
+                                            ):
+                                                try:
+                                                    _exc = _fut.exception()
+                                                except (
+                                                    asyncio.CancelledError,
+                                                    Exception,
+                                                ):
+                                                    _exc = None
+                                                    _committed = False
+                                                else:
+                                                    _committed = _exc is None and (
+                                                        bool(
+                                                            getattr(
+                                                                _agent,
+                                                                "_last_compaction_in_place",
+                                                                False,
+                                                            )
+                                                        )
+                                                        or getattr(
+                                                            _agent, "session_id", _sid
+                                                        )
+                                                        != _sid
+                                                    )
+                                                if _committed:
+                                                    logger.info(
+                                                        "Session hygiene compression for "
+                                                        "session %s finished after the "
+                                                        "turn-hold was released — summary "
+                                                        "adopted at the watermark-fenced "
+                                                        "commit boundary (#97963)",
+                                                        _sid,
+                                                    )
+                                                    try:
+                                                        _reset_hygiene_failure_streak(
+                                                            _gw, _skey
+                                                        )
+                                                    except Exception as _rs_err:
+                                                        logger.debug(
+                                                            "hygiene streak reset after "
+                                                            "deferred adoption failed: %s",
+                                                            _rs_err,
+                                                        )
+                                                else:
+                                                    # Nothing to adopt (summary failed,
+                                                    # fence refused the commit, or the
+                                                    # attempt was superseded). Restore
+                                                    # the pre-#97963 spacing so
+                                                    # sustained traffic does not spawn
+                                                    # and abandon a fresh compressor
+                                                    # every turn. Flat and
+                                                    # non-escalating: the streak must
+                                                    # not advance for a deferral.
+                                                    _record_hygiene_cooldown(
+                                                        _gw, _sid,
+                                                        _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                                                        "hygiene compression deferred: "
+                                                        "turn-hold budget expired and the "
+                                                        "detached attempt did not commit",
+                                                    )
+
+                                            _hyg_future.add_done_callback(
+                                                _hyg_adopt_or_space_retry
+                                            )
+                                            from agent.session_activity import (
+                                                ActivityProvenance,
+                                            )
+                                            _stamp_hygiene_compression_provenance(
+                                                _hyg_agent,
+                                                "session hygiene compression turn-hold",
+                                                ActivityProvenance.AGENT_COMPRESSION_TURNHOLD,
+                                                "hygiene compression turn-hold "
+                                                "activity stamp failed",
+                                            )
+                                            logger.info(
+                                                "Session hygiene compression for session %s "
+                                                "exceeded turn-hold budget (%.1fs); "
+                                                "proceeding without compression this turn — "
+                                                "the watermark-fenced worker keeps its "
+                                                "commit admission and the summary will be "
+                                                "adopted when it finishes",
+                                                session_entry.session_id,
+                                                time.monotonic() - _hyg_wait_started,
+                                            )
+                                            _turnhold_msg = t(
+                                                "gateway.compress.turnhold_deferred"
+                                            )
+                                            try:
+                                                _adapter = self._adapter_for_source(source)
+                                                if _adapter and source.chat_id:
+                                                    await _adapter.send(
+                                                        source.chat_id,
+                                                        _turnhold_msg,
+                                                        metadata=_hyg_meta,
+                                                    )
+                                            except Exception as _werr:
+                                                logger.warning(
+                                                    "Failed to deliver compression-turnhold "
+                                                    "notice to user: %s",
+                                                    _werr,
+                                                )
+                                            raise
                                         _cancelled = None
                                         while _cancelled is None:
                                             if _hyg_commit_fence.commit_in_flight:
@@ -21985,6 +22223,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_agent, context="session hygiene"
                                         )
 
+                    except HygieneTurnHoldExceeded:
+                        # Availability boundary, not a failure — already logged
+                        # at INFO by the turn-hold handler. Must not hit the
+                        # generic "auto-compress failed" warning below: that
+                        # log is how thinking-model deployments read as
+                        # permanently broken (#97963; surfaced by @686f6c61
+                        # in PR #99657).
+                        pass
                     except Exception as e:
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
@@ -27116,8 +27362,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
-                from gateway.wake import adapter_supports_push, deliver_wake
+                from gateway.wake import (
+                    adapter_supports_push,
+                    deliver_wake,
+                    persist_delegation_delivery,
+                )
                 if adapter is not None and not adapter_supports_push(adapter):
+                    if evt.get("type") == "async_delegation":
+                        # #85957: after the parent turn's event.complete the
+                        # CLIENT owns the next turn on this stateless surface.
+                        # Persist the completion as a durable delivery row —
+                        # never self-post it as a new role=user prompt.
+                        try:
+                            logger.info(
+                                "Async delegation completion — persisting "
+                                "delivery row for api_server session %s "
+                                "(no wake turn)",
+                                raw_sid,
+                            )
+                            await persist_delegation_delivery(
+                                adapter, text=synth_text,
+                                session_id=raw_sid, evt=evt,
+                            )
+                            return True
+                        except Exception as e:
+                            logger.warning(
+                                "Async delegation delivery persist failed "
+                                "for session %s: %s",
+                                raw_sid, e,
+                            )
+                            return False
                     try:
                         logger.info(
                             "Watch pattern notification — waking api_server "
@@ -27183,8 +27457,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which binds chat_id = session_id). handle_message would run the
             # wake under a build_session_key()-derived key that never matches
             # the raw X-Hermes-Session-Id session — self-post instead.
-            from gateway.wake import deliver_wake
+            from gateway.wake import deliver_wake, persist_delegation_delivery
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+            if evt.get("type") == "async_delegation":
+                # #85957: same client-owns-the-turn rule as the raw-key branch
+                # above — persist the completion as a delivery row, never
+                # self-post it as a new role=user prompt.
+                try:
+                    logger.info(
+                        "Async delegation completion — persisting delivery "
+                        "row for api_server session %s (no wake turn)",
+                        raw_sid,
+                    )
+                    await persist_delegation_delivery(
+                        adapter, text=synth_text, session_id=raw_sid, evt=evt,
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(
+                        "Async delegation delivery persist failed for "
+                        "session %s: %s",
+                        raw_sid, e,
+                    )
+                    return False
             try:
                 logger.info(
                     "Watch pattern notification — waking api_server session "
@@ -32269,17 +32564,18 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         if tick_count % AUTO_ARCHIVE_EVERY == 0:
             try:
                 from hermes_cli.config import load_config as _load_full_config
-                from hermes_state import SessionDB
+                from hermes_state import get_shared_session_db, release_shared_session_db
                 _sess_cfg = (_load_full_config().get("sessions") or {})
                 if _sess_cfg.get("auto_archive", False):
-                    _adb = SessionDB()
+                    _adb = get_shared_session_db()
                     try:
                         _adb.maybe_auto_archive(
                             idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                             min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                         )
                     finally:
-                        _adb.close()
+                        from hermes_state import release_or_close
+                        release_or_close(_adb)
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
 
@@ -33424,8 +33720,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     return True
 
 
+def _guard_corrupt_user_config() -> None:
+    """Fail closed when the active profile's config.yaml cannot be parsed.
+
+    The gateway is a fully non-interactive surface: nobody is present to
+    repair a corrupt ``config.yaml``, and silently continuing on built-in
+    defaults lets provider auto-detection adopt credentials from ``.env``
+    that the config never named (issue #81952). Same policy and escape
+    hatch (``HERMES_IGNORE_USER_CONFIG=1``) as the non-interactive CLI
+    guard in ``hermes_cli/main.py``.
+    """
+    from hermes_cli.config import (
+        InvalidUserConfigError,
+        require_parseable_user_config,
+    )
+
+    try:
+        require_parseable_user_config()
+    except InvalidUserConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def main():
     """CLI entry point for the gateway."""
+    # Refuse to start on a corrupt config.yaml — before any config-dependent
+    # startup (watchdog, DB opens, provider resolution). See _guard docstring.
+    _guard_corrupt_user_config()
+
     # Advertise the agent harness to child processes (AI_AGENT is the
     # cross-agent standard; HERMES_AGENT the Hermes-specific marker — see
     # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid
