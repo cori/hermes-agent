@@ -1956,7 +1956,12 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        assert "OOMPolicy=kill" in properties
+        # OOMPolicy is intentionally absent: systemd <250 rejects it on
+        # transient scope units ("Unknown assignment"), which broke the
+        # availability probe on this Ubuntu 22.04 host (systemd 249).
+        # MemoryMax still isolates the worker cgroup, so an OOM in the
+        # worker kills only the worker, never the gateway cgroup.
+        assert "OOMPolicy=kill" not in properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )

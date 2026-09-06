@@ -131,7 +131,10 @@ def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
         binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
-        "--property", "OOMPolicy=kill",
+        # OOMPolicy omitted: systemd <250 rejects it on transient scope units
+        # ("Unknown assignment"), which makes the probe fail permanently on
+        # systemd 249 hosts. MemoryMax still isolates the worker cgroup so an
+        # OOM in the worker kills only the worker, never the gateway cgroup.
         "--", *argv,
     ]
 
