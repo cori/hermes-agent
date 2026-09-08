@@ -1956,12 +1956,10 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        # OOMPolicy is intentionally absent: systemd <250 rejects it on
-        # transient scope units ("Unknown assignment"), which broke the
-        # availability probe on this Ubuntu 22.04 host (systemd 249).
-        # MemoryMax still isolates the worker cgroup, so an OOM in the
-        # worker kills only the worker, never the gateway cgroup.
-        assert "OOMPolicy=kill" not in properties
+        # systemd rejects OOMPolicy= on transient --scope units across the versions
+        # users run (239/245/249, #102486); emitting it fails the probe and every
+        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
+        assert not any(p.startswith("OOMPolicy=") for p in properties), properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )
@@ -2370,6 +2368,12 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
+        # The probe must not carry OOMPolicy= either: that is the argv systemd
+        # rejected on scope units and cached as "unavailable" (#102486).
+        probe_argv = probe_calls[0][0]
+        assert not any(
+            value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
+        ), probe_argv
 
     def test_systemd_scope_first_probe_is_serialized(self, monkeypatch):
         """Concurrent first-use callers must wait for one definitive probe.
