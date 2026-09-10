@@ -386,13 +386,12 @@ class GatewayNotificationsMixin:
         result, so a final refused here (flood control, a transport that had just died) left no
         ledger row and was gone for good. The ledger identity is the raw inbound message id;
         ``event_message_id`` is only the reply anchor, which is None wherever replies are not used
-        (Telegram forum topics, Slack reaction handoffs) and so cannot identify the turn. Adapters
-        without the base contract and sends without a session key keep the plain send."""
+        (Telegram forum topics, Slack reaction handoffs) and so cannot identify the turn; with no
+        inbound id the ledger falls back to the event's own (empty) message id. Adapters without
+        the base contract and sends without a session key keep the plain send."""
         if session_key and isinstance(adapter, BasePlatformAdapter):
-            ledger_message_id = (
-                inbound_message_id if inbound_message_id is not None else event_message_id)
-            result = await adapter.send_final_ledgered(
-                MessageEvent(text="", source=source, message_id=ledger_message_id),
+            result, _ = await adapter.send_final_ledgered(
+                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)
@@ -1417,6 +1416,15 @@ class GatewayNotificationsMixin:
         the group, None when nothing is deliverable here (retry siblings requeued)."""
         from gateway.run import _format_gateway_process_notification
         from tools.process_registry import process_registry as _pr
+        # API delivery does not start a model turn, so there is nothing to coalesce.
+        # Keep each unit's stable identity with its row across partial delivery/retry.
+        if group and group[0].get("origin_session_id"):
+            outcomes = []
+            for evt in group:
+                text = _format_gateway_process_notification(evt)
+                if text:
+                    outcomes.append(await self._deliver_completion_notification(text, evt))
+            return False if False in outcomes else True
         deliverable: list[tuple[dict, str]] = []
         for evt in group:
             synth_text = _format_gateway_process_notification(evt)
