@@ -124,6 +124,10 @@ else
   TEST_RESULTS=1
 fi
 
+# Archive the smoke-test session immediately so it doesn't show up in the
+# desktop session list. Silent when nothing to archive.
+python3 "$HOME/.hermes/scripts/archive-smoke-test-sessions.py" || true
+
 # 7. Summary
 echo
 LOG "=== SIDECAR INTEGRATION SUMMARY ==="
