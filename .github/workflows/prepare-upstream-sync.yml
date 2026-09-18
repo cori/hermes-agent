@@ -60,7 +60,7 @@ jobs:
       - name: Open or refresh fork sync PR
         if: steps.merge.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
           UPSTREAM_REF: ${{ inputs.upstream_ref }}
         run: |
           set -euo pipefail
