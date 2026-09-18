@@ -1,0 +1,88 @@
+name: Prepare upstream sync
+
+on:
+  schedule:
+    # Run daily at 03:00 UTC - creates/updates an auto-merging PR with upstream changes
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream branch or commit to prepare for review
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: prepare-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          # Do NOT persist the default GITHUB_TOKEN as the git credential:
+          # it cannot push changes to .github/workflows/* files. The merge
+          # step switches the push URL to SYNC_PAT (contents + workflows).
+          persist-credentials: false
+
+      - name: Prepare upstream merge
+        id: merge
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git remote set-url origin "https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/${{ github.repository }}.git"
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+          git checkout -B sync/upstream-main origin/main
+          BEFORE=$(git rev-parse HEAD)
+          git merge --no-ff --no-edit FETCH_HEAD
+
+          if [ "$BEFORE" = "$(git rev-parse HEAD)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push --force-with-lease origin sync/upstream-main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh fork sync PR
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          if gh pr list \
+            --repo "${{ github.repository }}" \
+            --base main \
+            --head "${{ github.repository_owner }}:sync/upstream-main" \
+            --state open \
+            --json number \
+            --jq 'length > 0' | grep -qx true; then
+            echo "Updated existing sync PR."
+            gh pr edit \
+              --repo "${{ github.repository }}" \
+              --add-label "automerge" \
+              "sync/upstream-main" || true
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base main \
+            --head sync/upstream-main \
+            --title "chore: sync upstream ${UPSTREAM_REF}" \
+            --label "automerge" \
+            --body "Prepared from NousResearch/hermes-agent@${UPSTREAM_REF}. Auto-merge enabled — merges automatically when CI passes so the fork's main stays on upstream tip."
