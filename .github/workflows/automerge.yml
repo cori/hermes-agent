@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Automerge labeled PRs once checks are green
-        uses: pascalgn/automerge-action@a4ba3817b71522d026f0edbb4c3de3bc22f8b4fc # v0.16.4
+        uses: pascalgn/automerge-action@v0.16.3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MERGE_METHOD: squash
