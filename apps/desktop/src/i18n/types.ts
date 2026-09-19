@@ -59,45 +59,6 @@ interface AuxTaskCopy {
 }
 
 export interface Translations {
-  catalog: {
-    listView: string
-    cardView: string
-    installTitle: (name: string) => string
-    installDescription: string
-    installTo: string
-    thisComputer: string
-    installing: string
-    installComplete: (name: string) => string
-    destinationChanged: string
-    browse: string
-    installed: string
-    searchSkills: string
-    searchPlugins: string
-    allSources: string
-    allCategories: string
-    about: string
-    author: string
-    source: string
-    category: string
-    version: string
-    platforms: string
-    requires: string
-    tools: string
-    hooks: string
-    repository: string
-    documentation: string
-    noResults: string
-    tryAnother: string
-    clearFilters: string
-    loadFailed: string
-    retry: string
-    more: string
-    pinned: string
-    snapshotHint: string
-    installHint: string
-    results: (count: number) => string
-    back: string
-  }
   connectors: {
     title: string
     connect: string
@@ -371,9 +332,11 @@ export interface Translations {
     // bodies (the agent's reply, a command, an error) are passed through raw.
     native: {
       approvalTitle: string
+      approvalTitleNamed: (session: string) => string
       approveAction: string
       rejectAction: string
       inputTitle: string
+      inputTitleNamed: (session: string) => string
       inputBody: string
       turnDoneTitle: string
       turnDoneBody: string
@@ -2252,6 +2215,7 @@ export interface Translations {
     emptyTitleSearch: string
     last: string
     next: string
+    overdueSince: string
     noRuns: string
     manage: string
     showRuns: string
@@ -2614,6 +2578,8 @@ export interface Translations {
     attachments: (count: number) => string
     editingInComposer: string
     editingQueuedInComposer: string
+    restoredDraftNotice: string
+    restoredDraftUndo: string
     queueEdit: string
     queueSendNext: string
     queueSend: string
