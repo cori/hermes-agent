@@ -1,0 +1,23 @@
+name: sync-upstream
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# main is a pure mirror of upstream/main. Zero local commits. No rebase.
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch upstream and force-push to this fork's main
+        env:
+          PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          git init -b main .
+          git remote add origin "https://x-access-token:${PAT}@github.com/${{ github.repository }}.git"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --depth=1 upstream main
+          git push origin FETCH_HEAD:main --force-with-lease
